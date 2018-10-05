@@ -1,52 +1,16 @@
 import json
 
-from django.db import models
 from django.contrib.contenttypes.models import ContentType
-from django.contrib.contenttypes.fields import GenericForeignKey
 from django.core.urlresolvers import reverse
-from django.shortcuts import get_object_or_404
+from django.db import models
 from django.utils.translation import ugettext_lazy as _
-from mailchimp.utils import get_connection
 
+try:
+    from django.contrib.contenttypes.fields import GenericForeignKey
+except ImportError:
+    from django.contrib.contenttypes.generic import GenericForeignKey
 
-class QueueManager(models.Manager):
-    def queue(self, campaign_type, contents, list_id, template_id, subject,
-        from_email, from_name, to_name, folder_id=None, tracking_opens=True,
-        tracking_html_clicks=True, tracking_text_clicks=False, title=None,
-        authenticate=False, google_analytics=None, auto_footer=False,
-        auto_tweet=False, segment_options=False, segment_options_all=True,
-        segment_options_conditions=[], type_opts={}, obj=None, extra_info=[]):
-        """
-        Queue a campaign
-        """
-        kwargs = locals().copy()
-        kwargs['segment_options_conditions'] = json.dumps(segment_options_conditions)
-        kwargs['type_opts'] = json.dumps(type_opts)
-        kwargs['contents'] = json.dumps(contents)
-        kwargs['extra_info'] = json.dumps(extra_info)
-        for thing in ('template_id', 'list_id'):
-            thingy = kwargs[thing]
-            if hasattr(thingy, 'id'):
-                kwargs[thing] = thingy.id
-        del kwargs['self']
-        del kwargs['obj']
-        if obj:
-            kwargs['object_id'] = obj.pk
-            kwargs['content_type'] = ContentType.objects.get_for_model(obj)
-        kwargs['to_email'] = kwargs.pop('to_name')
-        return self.create(**kwargs)
-
-    def dequeue(self, limit=None):
-        if limit:
-            qs = self.filter(locked=False)[:limit]
-        else:
-            qs = self.filter(locked=False)
-        for obj in qs:
-             yield obj.send()
-
-    def get_or_404(self, *args, **kwargs):
-        return get_object_or_404(self.model, *args, **kwargs)
-
+from .managers import CampaignManager, QueueManager
 
 
 class Queue(models.Model):
@@ -58,9 +22,9 @@ class Queue(models.Model):
     list_id = models.CharField(max_length=50)
     template_id = models.PositiveIntegerField()
     subject = models.CharField(max_length=255)
-    from_email = models.EmailField()
+    from_email = models.EmailField(max_length=254)
     from_name = models.CharField(max_length=255)
-    to_email = models.EmailField()
+    to_email = models.EmailField(max_length=254)
     folder_id = models.CharField(max_length=50, null=True, blank=True)
     tracking_opens = models.BooleanField(default=True)
     tracking_html_clicks = models.BooleanField(default=True)
@@ -72,7 +36,7 @@ class Queue(models.Model):
     generate_text = models.BooleanField(default=False)
     auto_tweet = models.BooleanField(default=False)
     segment_options = models.BooleanField(default=False)
-    segment_options_all = models.BooleanField()
+    segment_options_all = models.BooleanField(default=False)
     segment_options_conditions = models.TextField()
     type_opts = models.TextField()
     content_type = models.ForeignKey(ContentType, null=True, blank=True)
@@ -87,33 +51,62 @@ class Queue(models.Model):
         """
         send (schedule) this queued object
         """
+        from .utils import get_connection
+
         # check lock
         if self.locked:
             return False
         # aquire lock
         self.locked = True
         self.save()
+
         # get connection and send the mails
-        c = get_connection()
-        tpl = c.get_template_by_id(self.template_id)
-        content_data = dict([(str(k), v) for k,v in json.loads(self.contents).items()])
-        built_template = tpl.build(**content_data)
-        tracking = {'opens': self.tracking_opens,
-                    'html_clicks': self.tracking_html_clicks,
-                    'text_clicks': self.tracking_text_clicks}
+        connection = get_connection()
+        template = connection.get_template_by_id(self.template_id)
+
+        content_data = dict([(str(k), v) for k, v in json.loads(self.contents).items()])
+        built_template = template.build(**content_data)
+
+        tracking = {
+            'opens': self.tracking_opens,
+            'html_clicks': self.tracking_html_clicks,
+            'text_clicks': self.tracking_text_clicks,
+        }
+
         if self.google_analytics:
-            analytics = {'google': self.google_analytics}
+            analytics = {'google_analytics': self.google_analytics}
         else:
             analytics = {}
-        segment_opts = {'match': 'all' if self.segment_options_all else 'any',
-            'conditions': json.loads(self.segment_options_conditions)}
+
+        segment_opts = {
+            'match': 'all' if self.segment_options_all else 'any',
+            'conditions': json.loads(self.segment_options_conditions),
+        }
+
         type_opts = json.loads(self.type_opts)
         title = self.title or self.subject
-        camp = c.create_campaign(self.campaign_type, c.get_list_by_id(self.list_id),
-            built_template, self.subject, self.from_email, self.from_name,
-            self.to_email, self.folder_id, tracking, title, self.authenticate,
-            analytics, self.auto_footer, self.generate_text, self.auto_tweet,
-            segment_opts, type_opts)
+
+        _list = connection.get_list_by_id(self.list_id)
+
+        camp = connection.create_campaign(
+            campaign_type=self.campaign_type,
+            campaign_list=_list,
+            template=built_template,
+            subject=self.subject,
+            reply_to=self.from_email,
+            from_name=self.from_name,
+            to_name=self.to_email,
+            folder_id=self.folder_id,
+            tracking=tracking,
+            title=title,
+            authenticate=self.authenticate,
+            analytics=analytics,
+            auto_footer=self.auto_footer,
+            auto_tweet=self.auto_tweet,
+            segment_opts=segment_opts,
+            rss_opts=type_opts,
+        )
+
         if camp.send_now_async():
             self.delete()
             kwargs = {}
@@ -135,6 +128,8 @@ class Queue(models.Model):
         return reverse('mailchimp_cancel', kwargs={'id': self.id})
 
     def get_list(self):
+        from .utils import get_connection
+
         return get_connection().lists[self.list_id]
 
     @property
@@ -154,36 +149,19 @@ class Queue(models.Model):
         if not self.object:
             return ''
         name = 'admin:%s_%s_change' % (self.object._meta.app_label,
-            self.object._meta.module_name)
+            self.object._meta.model_name)
         return reverse(name, args=(self.object.pk,))
 
     def can_dequeue(self, user):
         if user.is_superuser:
             return True
+
         if not user.is_staff:
             return False
+
         if callable(getattr(self.object, 'mailchimp_can_dequeue', None)):
             return self.object.mailchimp_can_dequeue(user)
         return user.has_perm('mailchimp.can_send') and user.has_perm('mailchimp.can_dequeue')
-
-
-class CampaignManager(models.Manager):
-    def create(self, campaign_id, segment_opts, content_type=None, object_id=None,
-            extra_info=[]):
-        con = get_connection()
-        camp = con.get_campaign_by_id(campaign_id)
-        extra_info = json.dumps(extra_info)
-        obj = self.model(content=camp.content, campaign_id=campaign_id,
-             name=camp.title, content_type=content_type, object_id=object_id,
-             extra_info=extra_info)
-        obj.save()
-        segment_opts = dict([(str(k), v) for k,v in segment_opts.items()])
-        for email in camp.list.filter_members(segment_opts):
-            Reciever.objects.create(campaign=obj, email=email)
-        return obj
-
-    def get_or_404(self, *args, **kwargs):
-        return get_object_or_404(self.model, *args, **kwargs)
 
 
 class DeletedCampaign(object):
@@ -216,7 +194,7 @@ class Campaign(models.Model):
         if not self.object:
             return ''
         name = 'admin:%s_%s_change' % (self.object._meta.app_label,
-            self.object._meta.module_name)
+            self.object._meta.model_name)
         return reverse(name, args=(self.object.pk,))
 
     def get_extra_info(self):
@@ -239,6 +217,8 @@ class Campaign(models.Model):
 
     @property
     def mc(self):
+        from .utils import get_connection
+
         try:
             if not hasattr(self, '_mc'):
                 self._mc = get_connection().get_campaign_by_id(self.campaign_id)
@@ -248,5 +228,5 @@ class Campaign(models.Model):
 
 
 class Reciever(models.Model):
-    campaign = models.ForeignKey(Campaign, related_name='recievers')
-    email = models.EmailField()
+    campaign = models.ForeignKey(Campaign, related_name='receivers')
+    email = models.EmailField(max_length=254)
